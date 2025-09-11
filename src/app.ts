@@ -23,15 +23,9 @@ app.post("/join", controller.joinGame);
 app.get("/users", controller.getAllUsers);
 app.post("/buyToken", controller.buyToken);
 app.get("/countTokens/:user_id", controller.getTokenCount);
+app.post("/withdraw", controller.withdrawRequest);
 
 let onlineUsers: { userId: string; username: string; socketId: string }[] = [];
-
-// 📌 Quiz questions array
-const questions = [
-  { round: 1, title: "What is 2 + 2?", answer: "4" },
-  { round: 2, title: "Capital of France?", answer: "Paris" },
-  { round: 3, title: "What color is the sky?", answer: "Blue" },
-];
 
 let currentRound = 0;
 let currentQuestion: any = null;

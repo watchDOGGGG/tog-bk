@@ -93,6 +93,41 @@ class Controller {
       });
     }
   };
+
+  public withdrawRequest = async (req: Request, res: Response) => {
+    try {
+      const { userId, amount, method } = req.body;
+      const response = await this.service.requestWithdrawal(
+        new Types.ObjectId(userId),
+        amount,
+        method
+      );
+      return res.status(201).json({
+        message: "Withdrawal initiated successfully",
+        data: response,
+      });
+    } catch (error: any) {
+      console.log(error);
+      return res.status(400).json({
+        message: "Error initiating withdrawal",
+        error: error.message,
+      });
+    }
+  };
+
+  // public async updateStatus(req: Request, res: Response) {
+  //   try {
+  //     const { status } = req.body;
+  //     const withdrawal = await this.service.updateWithdrawalStatus(
+  //       new Types.ObjectId(req.params.id),
+  //       status
+  //     );
+  //     return res.status(200).json({ success: true, withdrawal });
+  //   } catch (err: any) {
+  //     console.log(err);
+  //     return res.status(400).json({ success: false, message: err.message });
+  //   }
+  // }
 }
 
 export const controller = new Controller();

@@ -2,10 +2,13 @@ import { Types } from "mongoose";
 import { GameUserRepository } from "../db/game..user.db";
 import jwt from "jsonwebtoken";
 import { QuestionRepository } from "../db/game.question.db";
+import { WithdrawalRepository } from "../db/game.withdrawal.db";
 
 class GameService {
   private readonly gameUserRepository = GameUserRepository;
   private readonly questionRepository = QuestionRepository;
+  private readonly withdrawalRepository = WithdrawalRepository;
+
   /**
    * Join or login existing user
    */
@@ -91,6 +94,50 @@ class GameService {
       { $set: { answered_by: userId } },
       { new: true }
     );
+  }
+
+  public async requestWithdrawal(
+    userId: Types.ObjectId,
+    amount: number,
+    method: string
+  ) {
+    const user = await this.gameUserRepository.findById(userId);
+
+    if (!user) throw new Error("User not found");
+    if (user.balance < amount) throw new Error("Insufficient balance");
+
+    // Deduct balance
+    user.balance -= amount;
+    await user.save();
+
+    // Create withdrawal record
+    return this.withdrawalRepository.create({
+      userId,
+      amount,
+      method,
+      status: "pending",
+    });
+  }
+
+  // 📌 Update withdrawal status (admin)
+  public async updateWithdrawalStatus(
+    withdrawalId: Types.ObjectId,
+    status: "approved" | "rejected"
+  ) {
+    const withdrawal = await this.withdrawalRepository.findById(withdrawalId);
+    if (!withdrawal) throw new Error("Withdrawal not found");
+
+    withdrawal.status = status;
+    await withdrawal.save();
+
+    // Refund user if rejected
+    if (status === "rejected") {
+      await this.gameUserRepository.findByIdAndUpdate(withdrawal.userId, {
+        $inc: { balance: withdrawal.amount },
+      });
+    }
+
+    return withdrawal;
   }
 }
 

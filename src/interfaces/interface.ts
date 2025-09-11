@@ -28,3 +28,12 @@ export interface IQuestion extends Document {
   reward_amount: number;
   createdAt: Date;
 }
+
+export interface IWithdrawal extends Document {
+  userId: Types.ObjectId;
+  amount: number;
+  status: "pending" | "approved" | "rejected";
+  method: string; // e.g. bank, crypto, paypal
+  createdAt: Date;
+  updatedAt: Date;
+}
