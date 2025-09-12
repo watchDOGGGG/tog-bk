@@ -32,69 +32,35 @@ let currentQuestion: any = null;
 let winnerDeclared = false;
 let questionStartTime: number | null = null;
 const QUESTION_DURATION = 30; // seconds
+let roundTimeout: NodeJS.Timeout | null = null;
 
-// SOCKET
 io.on("connection", (socket) => {
   console.log("🔌 Socket connected:", socket.id);
 
-  // Handle joining players
+  // 🔹 Every new connection sees the player list (spectators too)
+  socket.emit("players:update", onlineUsers);
+
+  // 📌 Handle joining players (login)
   socket.on("user:join", ({ userId, username }) => {
     if (!onlineUsers.find((u) => u.userId === userId)) {
       onlineUsers.push({ userId, username, socketId: socket.id });
+    } else {
+      // update socketId if reconnect
+      onlineUsers = onlineUsers.map((u) =>
+        u.userId === userId ? { ...u, socketId: socket.id } : u
+      );
     }
 
     console.log("✅ Online users:", onlineUsers);
     io.emit("players:update", onlineUsers);
+
+    // ❌ Do NOT sync new users to current question
+    // They must wait for next round
   });
 
-  // 📌 Frontend asks for next question
+  // 📌 Start new question (first one manually, later auto)
   socket.on("quiz:getQuestion", async () => {
-    try {
-      const q = await gameService.getAndUpdateQuestion();
-
-      if (!q) {
-        io.emit("quiz:end", { message: "No more questions available!" });
-        return;
-      }
-
-      winnerDeclared = false;
-      currentRound++;
-      currentQuestion = q;
-      questionStartTime = Date.now(); // ⏱️ record start time
-
-      io.emit("quiz:question", {
-        round: currentRound,
-        questionId: q._id,
-        title: q.question,
-        category: q.category,
-        difficulty: q.difficulty,
-        reward_amount: q.reward_amount,
-        timeLeft: QUESTION_DURATION, // everyone starts with same countdown
-      });
-
-      console.log(`📢 Round ${currentRound}: ${q.question}`);
-    } catch (error: any) {
-      console.error("❌ Error fetching question:", error.message);
-      io.emit("quiz:error", { message: "Failed to fetch question" });
-    }
-  });
-
-  // 📌 New users can sync with the ongoing question
-  socket.on("quiz:syncQuestion", () => {
-    if (currentQuestion && questionStartTime) {
-      const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
-      const remaining = Math.max(0, QUESTION_DURATION - elapsed);
-
-      socket.emit("quiz:question", {
-        round: currentRound,
-        questionId: currentQuestion._id,
-        title: currentQuestion.question,
-        category: currentQuestion.category,
-        difficulty: currentQuestion.difficulty,
-        reward_amount: currentQuestion.reward_amount,
-        timeLeft: remaining, // ✅ synced countdown
-      });
-    }
+    await startNewQuestion();
   });
 
   // 📌 Player submits answer
@@ -103,8 +69,18 @@ io.on("connection", (socket) => {
     if (winnerDeclared) return;
     if (!currentQuestion) return;
 
+    const elapsed = Math.floor((Date.now() - questionStartTime!) / 1000);
+    if (elapsed >= QUESTION_DURATION) {
+      socket.emit("quiz:incorrect", {
+        round,
+        correctAnswer: currentQuestion.answer,
+        message: "⏰ Too late! Round already ended.",
+      });
+      return;
+    }
+
     try {
-      // ✅ Deduct 1 token
+      // Deduct 1 token
       let updatedUser = await gameService.useToken(
         new Types.ObjectId(userId),
         1
@@ -127,13 +103,13 @@ io.on("connection", (socket) => {
       if (answer.trim().toLowerCase() === correctAnswer.toLowerCase()) {
         winnerDeclared = true;
 
-        // ✅ Reward user (get fresh doc back)
+        // Reward user
         updatedUser = await gameService.addBalance(
           new Types.ObjectId(userId),
           currentQuestion.reward_amount || 0
         );
 
-        // ✅ Mark question answered
+        // Mark question answered
         await gameService.markAnswered(
           currentQuestion._id,
           new Types.ObjectId(userId)
@@ -156,6 +132,20 @@ io.on("connection", (socket) => {
         });
 
         console.log(`🏆 Winner: ${username} for round ${round}`);
+
+        // End round early
+        if (roundTimeout) clearTimeout(roundTimeout);
+        currentQuestion = null;
+
+        // Start next round automatically
+        setTimeout(() => startNewQuestion(), 2000);
+      } else {
+        // ❌ Wrong answer only goes back to that user
+        socket.emit("quiz:incorrect", {
+          round,
+          correctAnswer,
+          message: "Wrong answer!",
+        });
       }
     } catch (error: any) {
       console.error("❌ Error in quiz:answer:", error.message);
@@ -165,13 +155,71 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle disconnect
+  // 📌 Handle disconnect
   socket.on("disconnect", () => {
     onlineUsers = onlineUsers.filter((u) => u.socketId !== socket.id);
     console.log("❌ User disconnected:", socket.id);
     io.emit("players:update", onlineUsers);
   });
 });
+
+/**
+ * Start new question round
+ */
+async function startNewQuestion() {
+  try {
+    // ✅ Only start if more than 1 user is online
+    if (onlineUsers.length < 2) {
+      console.log("⏸️ Not enough players online. Waiting...");
+      return;
+    }
+
+    const q = await gameService.getAndUpdateQuestion();
+    if (!q) {
+      io.emit("quiz:end", { message: "No more questions available!" });
+      return;
+    }
+
+    // Reset round state
+    winnerDeclared = false;
+    currentRound++;
+    currentQuestion = q;
+    questionStartTime = Date.now();
+
+    if (roundTimeout) clearTimeout(roundTimeout);
+
+    // Timeout for this round
+    roundTimeout = setTimeout(() => {
+      if (!winnerDeclared && currentQuestion) {
+        io.emit("quiz:end", {
+          round: currentRound,
+          correctAnswer: currentQuestion.answer,
+          message: "⏰ Time is up! No winner this round.",
+        });
+        currentQuestion = null;
+
+        // Auto-start next round only if enough players are online
+        setTimeout(() => startNewQuestion(), 2000);
+      }
+    }, QUESTION_DURATION * 1000);
+
+    // Broadcast new question
+    io.emit("quiz:question", {
+      round: currentRound,
+      questionId: q._id,
+      title: q.question,
+      category: q.category,
+      difficulty: q.difficulty,
+      reward_amount: q.reward_amount,
+      timeLeft: QUESTION_DURATION,
+    });
+
+    console.log(`📢 Round ${currentRound}: ${q.question}`);
+  } catch (error: any) {
+    console.error("❌ Error fetching question:", error.message);
+    io.emit("quiz:error", { message: "Failed to fetch question" });
+  }
+}
 
 const PORT = process.env.PORT || 5000;
 
