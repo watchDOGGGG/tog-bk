@@ -3,6 +3,7 @@ import { GameUserRepository } from "../db/game..user.db";
 import jwt from "jsonwebtoken";
 import { QuestionRepository } from "../db/game.question.db";
 import { WithdrawalRepository } from "../db/game.withdrawal.db";
+import bcrypt from "bcryptjs";
 
 class GameService {
   private readonly gameUserRepository = GameUserRepository;
@@ -12,17 +13,36 @@ class GameService {
   /**
    * Join or login existing user
    */
-  public async joinGame(username: string, platform: string) {
+
+  public async joinGame(username: string, platform: string, passkey: string) {
     // 1. Try to find the user
     let user = await this.gameUserRepository.findOne({ username });
 
-    // 2. If not found, create a new user
-    if (!user) {
-      user = new this.gameUserRepository({ username, platform });
+    if (user) {
+      // 2. If user exists, check passkey
+      if (!user.passkey) {
+        // For old accounts with no passkey, set one
+        const hashedPasskey = await bcrypt.hash(passkey, 10);
+        user.passkey = hashedPasskey;
+        await user.save();
+      } else {
+        const isMatch = await bcrypt.compare(passkey, user.passkey);
+        if (!isMatch) {
+          throw new Error("Invalid passkey. Access denied.");
+        }
+      }
+    } else {
+      // 3. If not found, create new user with hashed passkey
+      const hashedPasskey = await bcrypt.hash(passkey, 10);
+      user = new this.gameUserRepository({
+        username,
+        platform,
+        passkey: hashedPasskey,
+      });
       await user.save();
     }
 
-    // 3. Generate JWT (expires in 7 days)
+    // 4. Generate JWT (expires in 7 days)
     const token = jwt.sign(
       { userId: user._id, username: user.username },
       process.env.JWT_SECRET || "supersecret",
@@ -34,6 +54,18 @@ class GameService {
 
   public async getAllUsers() {
     return this.gameUserRepository.find();
+  }
+
+  public async getUserById(userId: Types.ObjectId) {
+    const objectId = new Types.ObjectId(userId);
+
+    const user = await this.gameUserRepository.findById(objectId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    return user;
   }
 
   /**
@@ -138,6 +170,22 @@ class GameService {
     }
 
     return withdrawal;
+  }
+
+  public async updateExp(userId: string, exp: number): Promise<number> {
+    const objectId = new Types.ObjectId(userId);
+
+    const user = await this.gameUserRepository.findByIdAndUpdate(
+      objectId,
+      { exp },
+      { new: true, select: "exp" }
+    );
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    return user.exp;
   }
 }
 

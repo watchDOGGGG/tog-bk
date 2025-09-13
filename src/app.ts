@@ -25,7 +25,12 @@ app.post("/buyToken", controller.buyToken);
 app.get("/countTokens/:user_id", controller.getTokenCount);
 app.post("/withdraw", controller.withdrawRequest);
 
-let onlineUsers: { userId: string; username: string; socketId: string }[] = [];
+let onlineUsers: {
+  userId: string;
+  username: string;
+  exp: number;
+  socketId: string;
+}[] = [];
 
 let currentRound = 0;
 let currentQuestion: any = null;
@@ -41,18 +46,26 @@ io.on("connection", (socket) => {
   socket.emit("players:update", onlineUsers);
 
   // 📌 Handle joining players (login)
-  socket.on("user:join", ({ userId, username }) => {
-    if (!onlineUsers.find((u) => u.userId === userId)) {
-      onlineUsers.push({ userId, username, socketId: socket.id });
-    } else {
-      // update socketId if reconnect
-      onlineUsers = onlineUsers.map((u) =>
-        u.userId === userId ? { ...u, socketId: socket.id } : u
-      );
-    }
+  socket.on("user:join", async ({ userId, username }) => {
+    try {
+      // Get user exp from DB (default 0 if not found)
+      const userDoc = await gameService.getUserById(new Types.ObjectId(userId));
+      const exp = userDoc?.exp ?? 0;
 
-    console.log("✅ Online users:", onlineUsers);
-    io.emit("players:update", onlineUsers);
+      if (!onlineUsers.find((u) => u.userId === userId)) {
+        onlineUsers.push({ userId, username, exp, socketId: socket.id });
+      } else {
+        // update socketId + exp if reconnect
+        onlineUsers = onlineUsers.map((u) =>
+          u.userId === userId ? { ...u, socketId: socket.id, exp } : u
+        );
+      }
+
+      console.log("✅ Online users:", onlineUsers);
+      io.emit("players:update", onlineUsers);
+    } catch (err) {
+      console.error("❌ Error fetching user exp:", err);
+    }
 
     // ❌ Do NOT sync new users to current question
     // They must wait for next round
@@ -97,16 +110,29 @@ io.on("connection", (socket) => {
       io.to(socket.id).emit("quiz:userUpdate", {
         tokens: updatedUser.tokens,
         balance: updatedUser.balance,
+        exp: updatedUser.exp,
       });
 
       const correctAnswer = currentQuestion.answer;
       if (answer.trim().toLowerCase() === correctAnswer.toLowerCase()) {
         winnerDeclared = true;
 
-        // Reward user
+        // Reward user with balance
         updatedUser = await gameService.addBalance(
           new Types.ObjectId(userId),
           currentQuestion.reward_amount || 0
+        );
+
+        // Increment EXP (+10 for correct answer)
+        const newExp = await gameService.updateExp(
+          userId,
+          (updatedUser!.exp ?? 0) + 1
+        );
+        updatedUser!.exp = newExp;
+
+        // Update exp in onlineUsers list
+        onlineUsers = onlineUsers.map((u) =>
+          u.userId === userId ? { ...u, exp: newExp } : u
         );
 
         // Mark question answered
@@ -122,14 +148,19 @@ io.on("connection", (socket) => {
           round,
           correctAnswer,
           reward: currentQuestion.reward_amount || 0,
+          exp: newExp,
           message: `${username} won Round ${round}! 🎉`,
         });
 
-        // Send winner updated balance/tokens
+        // Send winner updated balance/tokens/exp
         io.to(socket.id).emit("quiz:userUpdate", {
           tokens: updatedUser!.tokens,
           balance: updatedUser!.balance,
+          exp: newExp,
         });
+
+        // Broadcast updated players list (with exp)
+        io.emit("players:update", onlineUsers);
 
         console.log(`🏆 Winner: ${username} for round ${round}`);
 

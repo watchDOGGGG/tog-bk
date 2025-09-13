@@ -7,12 +7,13 @@ class Controller {
 
   public joinGame = async (req: Request, res: Response) => {
     try {
-      const { username, platform } = req.body as unknown as {
+      const { username, platform, passkey } = req.body as unknown as {
         username: string;
         platform: string;
+        passkey: string;
       };
 
-      const response = await this.service.joinGame(username, platform);
+      const response = await this.service.joinGame(username, platform, passkey);
 
       return res.status(201).json({
         message: "Joined",

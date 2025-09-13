@@ -10,6 +10,8 @@ export interface GameUserInterface extends Document {
   tokens: number;
   platform: Platform;
   balance: number;
+  exp: number;
+  passkey: string;
 }
 
 export interface TransactionInterface extends Document {
