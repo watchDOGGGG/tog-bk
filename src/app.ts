@@ -22,15 +22,33 @@ app.use(express.json());
 app.post("/join", controller.joinGame);
 app.get("/users", controller.getAllUsers);
 app.post("/buyToken", controller.buyToken);
-app.get("/countTokens/:user_id", controller.getTokenCount);
+app.get("/getTokenAndBalance/:user_id", controller.getTokenAndBalance);
 app.post("/withdraw", controller.withdrawRequest);
+app.post("/purchase-with-balance", controller.purchaseTokensWithBalance);
+app.get("/fetchQuestion", controller.generateQuestions);
 
 let onlineUsers: {
   userId: string;
   username: string;
   exp: number;
   socketId: string;
-}[] = [];
+  isBot?: boolean;
+}[] = [
+  {
+    userId: "650f2c5b9d1a4e12c4f1a01d",
+    username: "William",
+    exp: 97,
+    socketId: "i3j4k5l6",
+    isBot: true,
+  },
+  {
+    userId: "650f2c5b9d1a4e12c4f1a01e",
+    username: "Aria",
+    exp: 31,
+    socketId: "m7n8o9p0",
+    isBot: true,
+  },
+];
 
 let currentRound = 0;
 let currentQuestion: any = null;
@@ -38,28 +56,31 @@ let winnerDeclared = false;
 let questionStartTime: number | null = null;
 let waitStartTime: number | null = null;
 
-const QUESTION_DURATION = 30; // seconds to answer
-const WAIT_DURATION = 30; // seconds before next round
+const QUESTION_DURATION = 30; // seconds
+const WAIT_DURATION = 30; // seconds
 let roundTimeout: NodeJS.Timeout | null = null;
 let waitTimeout: NodeJS.Timeout | null = null;
 let startingQuestion = false;
 
-// track answers for the round
 let submissions: { [userId: string]: string } = {};
 
 /**
- * Socket handlers
+ * SOCKET HANDLERS
  */
 io.on("connection", (socket) => {
   console.log("🔌 Socket connected:", socket.id);
 
-  // initial sync: send players list
+  // Send players list
   socket.emit("players:update", onlineUsers);
 
-  // user joins
+  /**
+   * Player joins
+   */
   socket.on("user:join", async ({ userId, username }) => {
+    console.log(`👤 user:join received for ${username} (${userId})`);
+
     try {
-      // fetch user exp (optional) — keep as you had it
+      // Fetch exp
       let exp = 0;
       try {
         const userDoc = await gameService.getUserById(
@@ -67,27 +88,26 @@ io.on("connection", (socket) => {
         );
         exp = userDoc?.exp ?? 0;
       } catch (e) {
-        // ignore failures to fetch exp — continue with 0
         console.warn("Could not fetch user exp:", e);
       }
 
+      // Add/update online user
       const exists = onlineUsers.find((u) => u.userId === userId);
       if (!exists) {
+        console.log(`➕ Adding new user ${username}`);
         onlineUsers.push({ userId, username, exp, socketId: socket.id });
       } else {
+        console.log(`🔄 Updating user ${username}`);
         onlineUsers = onlineUsers.map((u) =>
           u.userId === userId ? { ...u, socketId: socket.id, exp } : u
         );
       }
 
-      console.log(
-        "✅ Online users:",
-        onlineUsers.map((u) => u.userId)
-      );
+      console.log("✅ Current online users:", onlineUsers);
+
       io.emit("players:update", onlineUsers);
 
-      // SYNC LOGIC FOR LATE JOINERS / START
-      // 1) If a question is active -> send the question with remaining time
+      // CASE 1: If question is active → sync question
       if (currentQuestion && questionStartTime) {
         const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
         const timeLeft = Math.max(0, QUESTION_DURATION - elapsed);
@@ -104,55 +124,49 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // 2) If a wait is currently running (started earlier and still counting) -> send remaining wait
+      // CASE 2: If waiting → sync waiting
       if (waitStartTime) {
         const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
         const timeLeft = Math.max(0, WAIT_DURATION - elapsed);
-
-        // If timeLeft > 0, sync the late-joiner to the existing wait
         if (timeLeft > 0) {
           socket.emit("quiz:waiting", { timeLeft });
           return;
         }
-        // if timeLeft <= 0, the wait has effectively expired; fall through to next checks
       }
 
-      // 3) No question and no active wait -> if this join made players count exactly 2, start wait and EMIT it
+      // CASE 3: If no game is running and this is the FIRST real user → start wait
+      const realUsers = onlineUsers.filter((u) => !u.isBot);
       if (
-        onlineUsers.length === 2 &&
+        realUsers.length === 1 && // first real user joined
         !waitTimeout &&
         !roundTimeout &&
         !currentQuestion
       ) {
-        console.log(
-          "⏳ Two players present after join; emitting quiz:waiting and starting wait."
-        );
-        startWaitingPeriod(true); // emitToAll = true
+        console.log("🚀 First real user joined. Starting waiting period...");
+        startWaitingPeriod(true);
         return;
       }
 
-      // else: nothing to emit; just updated players list
+      console.log("ℹ️ No active game state to sync for this join.");
     } catch (err) {
       console.error("❌ Error in user:join:", err);
       io.to(socket.id).emit("quiz:error", { message: "Failed to join game" });
     }
   });
 
-  // player submits answer
+  /**
+   * Player answers
+   */
   socket.on("quiz:answer", async ({ userId, username, round, answer }) => {
     try {
-      // basic guards
       if (round !== currentRound) return;
       if (winnerDeclared) return;
       if (!currentQuestion || !questionStartTime) return;
 
       const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
-      if (elapsed >= QUESTION_DURATION) {
-        // too late; ignore — final resolution will be sent on timeout
-        return;
-      }
+      if (elapsed >= QUESTION_DURATION) return;
 
-      // deduct token etc (your gameService call)
+      // consume token
       const updatedUser = await gameService.useToken(
         new Types.ObjectId(userId),
         1
@@ -170,13 +184,11 @@ io.on("connection", (socket) => {
         exp: updatedUser.exp,
       });
 
-      // store submission (do not reveal feedback now)
       submissions[userId] = answer.trim();
 
-      // check if answer is correct -> immediate winner flow
+      // check if correct
       const correctAnswer = currentQuestion.answer;
       if (answer.trim().toLowerCase() === correctAnswer.toLowerCase()) {
-        // winner found
         winnerDeclared = true;
 
         // reward
@@ -189,18 +201,15 @@ io.on("connection", (socket) => {
           (rewardedUser!.exp ?? 0) + 1
         );
 
-        // update onlineUsers exp
         onlineUsers = onlineUsers.map((u) =>
           u.userId === userId ? { ...u, exp: newExp } : u
         );
 
-        // mark answered in DB
         await gameService.markAnswered(
           currentQuestion._id,
           new Types.ObjectId(userId)
         );
 
-        // emit to everyone winner payload including waitTime (BUT DO NOT emit quiz:waiting)
         io.emit("quiz:winner", {
           userId,
           username,
@@ -212,10 +221,8 @@ io.on("connection", (socket) => {
           message: `${username} won Round ${currentRound}! 🎉`,
         });
 
-        // update players list
         io.emit("players:update", onlineUsers);
 
-        // cleanup question timeout, reset currentQuestion, clear submissions
         if (roundTimeout) {
           clearTimeout(roundTimeout);
           roundTimeout = null;
@@ -223,8 +230,7 @@ io.on("connection", (socket) => {
         currentQuestion = null;
         submissions = {};
 
-        // start silent waiting in background (no quiz:waiting emit)
-        startWaitingPeriod(false);
+        startWaitingPeriod(false); // silent wait
       }
     } catch (err) {
       console.error("❌ Error in quiz:answer:", err);
@@ -234,21 +240,20 @@ io.on("connection", (socket) => {
     }
   });
 
+  /**
+   * Disconnect
+   */
   socket.on("disconnect", () => {
     onlineUsers = onlineUsers.filter((u) => u.socketId !== socket.id);
-    console.log("❌ User disconnected:", socket.id);
     io.emit("players:update", onlineUsers);
 
-    // 🚨 If only one player left, stop question/wait and notify
-    if (onlineUsers.length < 2) {
-      if (roundTimeout) {
-        clearTimeout(roundTimeout);
-        roundTimeout = null;
-      }
-      if (waitTimeout) {
-        clearTimeout(waitTimeout);
-        waitTimeout = null;
-      }
+    const realUsers = onlineUsers.filter((u) => !u.isBot);
+
+    if (realUsers.length < 1) {
+      if (roundTimeout) clearTimeout(roundTimeout);
+      if (waitTimeout) clearTimeout(waitTimeout);
+      roundTimeout = null;
+      waitTimeout = null;
       currentQuestion = null;
       submissions = {};
       questionStartTime = null;
@@ -256,55 +261,46 @@ io.on("connection", (socket) => {
       winnerDeclared = false;
 
       io.emit("quiz:stopped", {
-        message: "Not enough players. Waiting for more to join...",
+        message: "Not enough real players. Waiting for more to join...",
       });
     }
   });
 });
 
 /**
- * Start waiting period before a question round
+ * HELPERS
  */
 function startWaitingPeriod(emitToAll = false) {
-  if (waitTimeout) {
-    clearTimeout(waitTimeout);
-    waitTimeout = null;
-  }
+  if (waitTimeout) clearTimeout(waitTimeout);
 
   waitStartTime = Date.now();
 
   if (emitToAll) {
-    // when two players just became ready, let clients know the wait starts now
     io.emit("quiz:waiting", { timeLeft: WAIT_DURATION });
   }
 
-  // run wait in background (no further emits required here if emitToAll=false)
   waitTimeout = setTimeout(() => {
     waitTimeout = null;
     waitStartTime = null;
-    // start next question only when still enough players
-    startNewQuestion().catch((err) => {
-      console.error("startNewQuestion error after wait:", err);
-    });
+    startNewQuestion().catch((err) =>
+      console.error("startNewQuestion error:", err)
+    );
   }, WAIT_DURATION * 1000);
 }
-/**
- * Start new question round
- */
+
 async function startNewQuestion() {
   if (startingQuestion) return;
   startingQuestion = true;
 
   try {
-    if (onlineUsers.length < 2) {
-      console.log("⏸️ Not enough players online. Waiting...");
+    const realUsers = onlineUsers.filter((u) => !u.isBot);
+    if (realUsers.length < 1) {
       startingQuestion = false;
       return;
     }
 
     const q = await gameService.getAndUpdateQuestion();
     if (!q) {
-      // no questions left -> broadcast end-of-game
       io.emit("quiz:end", { message: "No more questions available!" });
       startingQuestion = false;
       return;
@@ -316,12 +312,6 @@ async function startNewQuestion() {
     questionStartTime = Date.now();
     submissions = {};
 
-    if (roundTimeout) {
-      clearTimeout(roundTimeout);
-      roundTimeout = null;
-    }
-
-    // emit the question to everyone once, with answer-time duration
     io.emit("quiz:question", {
       round: currentRound,
       questionId: q._id,
@@ -332,18 +322,15 @@ async function startNewQuestion() {
       timeLeft: QUESTION_DURATION,
     });
 
-    console.log(`📢 Round ${currentRound} started (question id=${q._id})`);
+    if (roundTimeout) clearTimeout(roundTimeout);
 
-    // set a single timeout for the question duration
     roundTimeout = setTimeout(() => {
       roundTimeout = null;
 
-      // if nobody already won, evaluate submissions and emit per-user quiz:end with waitTime
       if (!winnerDeclared && currentQuestion) {
         onlineUsers.forEach((u) => {
           const submitted = submissions[u.userId];
           if (!submitted) {
-            // user didn't submit
             io.to(u.socketId).emit("quiz:end", {
               round: currentRound,
               correctAnswer: currentQuestion.answer,
@@ -354,23 +341,18 @@ async function startNewQuestion() {
             submitted.trim().toLowerCase() !==
             currentQuestion.answer.toLowerCase()
           ) {
-            // user submitted but wrong
             io.to(u.socketId).emit("quiz:end", {
               round: currentRound,
               correctAnswer: currentQuestion.answer,
               waitTime: WAIT_DURATION,
               message: "❌ Wrong answer!",
             });
-          } else {
-            // if someone submitted correct exactly on timeout edge (rare), treat as winner would have been handled earlier
-            // But we've guarded winnerDeclared above.
           }
         });
 
         currentQuestion = null;
         submissions = {};
 
-        // start wait in background WITHOUT emitting quiz:waiting to everyone
         startWaitingPeriod(false);
       }
     }, QUESTION_DURATION * 1000);

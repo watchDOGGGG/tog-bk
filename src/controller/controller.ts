@@ -7,13 +7,20 @@ class Controller {
 
   public joinGame = async (req: Request, res: Response) => {
     try {
-      const { username, platform, passkey } = req.body as unknown as {
-        username: string;
-        platform: string;
-        passkey: string;
-      };
+      const { username, platform, passkey, referralCode } =
+        req.body as unknown as {
+          username: string;
+          platform: string;
+          passkey: string;
+          referralCode: string;
+        };
 
-      const response = await this.service.joinGame(username, platform, passkey);
+      const response = await this.service.joinGame(
+        username,
+        platform,
+        passkey,
+        referralCode
+      );
 
       return res.status(201).json({
         message: "Joined",
@@ -76,10 +83,10 @@ class Controller {
     }
   };
 
-  public getTokenCount = async (req: Request, res: Response) => {
+  public getTokenAndBalance = async (req: Request, res: Response) => {
     try {
       const { user_id } = req.params;
-      const response = await this.service.getTokenCount(
+      const response = await this.service.getTokenAndBalance(
         new Types.ObjectId(user_id)
       );
 
@@ -112,6 +119,44 @@ class Controller {
       return res.status(400).json({
         message: "Error initiating withdrawal",
         error: error.message,
+      });
+    }
+  };
+
+  public purchaseTokensWithBalance = async (req: Request, res: Response) => {
+    try {
+      const { userId, tokensToBuy } = req.body;
+
+      const response = await this.service.purchaseTokensWithBalance(
+        new Types.ObjectId(userId),
+        tokensToBuy
+      );
+
+      return res.status(201).json({
+        message: "Tokens purchased successfully using balance",
+        data: response,
+      });
+    } catch (error: any) {
+      console.error(error);
+      return res.status(400).json({
+        message: "Error purchasing tokens",
+        error: error.message,
+      });
+    }
+  };
+
+  public generateQuestions = async (req: Request, res: Response) => {
+    try {
+      const questions = await this.service.generateQuestionsFromAI(50);
+      return res.status(201).json({
+        message: "Questions generated successfully",
+        count: questions.length,
+        data: questions,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        message: "Failed to generate questions",
+        error: err.message,
       });
     }
   };

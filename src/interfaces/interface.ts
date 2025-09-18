@@ -12,6 +12,9 @@ export interface GameUserInterface extends Document {
   balance: number;
   exp: number;
   passkey: string;
+  referral_code: string;
+  no_of_referrals: number;
+  referred_by: Types.ObjectId;
 }
 
 export interface TransactionInterface extends Document {
