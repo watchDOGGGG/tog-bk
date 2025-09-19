@@ -170,29 +170,26 @@ let waitStartTime: number | null = null;
 
 const QUESTION_DURATION = 30; // seconds
 const WAIT_DURATION = 30; // seconds
+const RESULT_DELAY = 10; // seconds (after first correct answer)
+
 let roundTimeout: NodeJS.Timeout | null = null;
 let waitTimeout: NodeJS.Timeout | null = null;
+let resultTimeout: NodeJS.Timeout | null = null;
+
 let startingQuestion = false;
 
 let submissions: { [userId: string]: string } = {};
+let firstCorrectUser: { userId: string; username: string } | null = null;
 
-/**
- * SOCKET HANDLERS
- */
 io.on("connection", (socket) => {
   console.log("🔌 Socket connected:", socket.id);
 
-  // Send players list
   socket.emit("players:update", onlineUsers);
 
-  /**
-   * Player joins
-   */
   socket.on("user:join", async ({ userId, username }) => {
     console.log(`👤 user:join received for ${username} (${userId})`);
 
     try {
-      // Fetch exp
       let exp = 0;
       try {
         const userDoc = await gameService.getUserById(
@@ -203,7 +200,6 @@ io.on("connection", (socket) => {
         console.warn("Could not fetch user exp:", e);
       }
 
-      // Add/update online user
       const exists = onlineUsers.find((u) => u.userId === userId);
       if (!exists) {
         console.log(`➕ Adding new user ${username}`);
@@ -219,24 +215,22 @@ io.on("connection", (socket) => {
 
       io.emit("players:update", onlineUsers);
 
-      // CASE 1: If question is active → sync question
       if (currentQuestion && questionStartTime) {
         const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
         const timeLeft = Math.max(0, QUESTION_DURATION - elapsed);
 
         socket.emit("quiz:question", {
           round: currentRound,
-          questionId: currentQuestion._id,
-          title: currentQuestion.question,
-          category: currentQuestion.category,
-          difficulty: currentQuestion.difficulty,
-          reward_amount: currentQuestion.reward_amount,
+          questionId: currentQuestion?._id,
+          title: currentQuestion?.question,
+          category: currentQuestion?.category,
+          difficulty: currentQuestion?.difficulty,
+          reward_amount: currentQuestion?.reward_amount,
           timeLeft,
         });
         return;
       }
 
-      // CASE 2: If waiting → sync waiting
       if (waitStartTime) {
         const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
         const timeLeft = Math.max(0, WAIT_DURATION - elapsed);
@@ -246,10 +240,9 @@ io.on("connection", (socket) => {
         }
       }
 
-      // CASE 3: If no game is running and this is the FIRST real user → start wait
       const realUsers = onlineUsers.filter((u) => !u.isBot);
       if (
-        realUsers.length === 1 && // first real user joined
+        realUsers.length === 1 &&
         !waitTimeout &&
         !roundTimeout &&
         !currentQuestion
@@ -266,19 +259,14 @@ io.on("connection", (socket) => {
     }
   });
 
-  /**
-   * Player answers
-   */
   socket.on("quiz:answer", async ({ userId, username, round, answer }) => {
     try {
       if (round !== currentRound) return;
-      if (winnerDeclared) return;
       if (!currentQuestion || !questionStartTime) return;
 
       const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
       if (elapsed >= QUESTION_DURATION) return;
 
-      // consume token
       const updatedUser = await gameService.useToken(
         new Types.ObjectId(userId),
         1
@@ -298,51 +286,19 @@ io.on("connection", (socket) => {
 
       submissions[userId] = answer.trim();
 
-      // check if correct
-      const correctAnswer = currentQuestion.answer;
-      if (answer.trim().toLowerCase() === correctAnswer.toLowerCase()) {
-        winnerDeclared = true;
+      const correctAnswer = currentQuestion?.answer;
+      if (
+        correctAnswer &&
+        answer.trim().toLowerCase() === correctAnswer.toLowerCase() &&
+        !firstCorrectUser
+      ) {
+        firstCorrectUser = { userId, username };
 
-        // reward
-        const rewardedUser = await gameService.addBalance(
-          new Types.ObjectId(userId),
-          currentQuestion.reward_amount || 0
-        );
-        const newExp = await gameService.updateExp(
-          userId,
-          (rewardedUser!.exp ?? 0) + 1
-        );
-
-        onlineUsers = onlineUsers.map((u) =>
-          u.userId === userId ? { ...u, exp: newExp } : u
-        );
-
-        await gameService.markAnswered(
-          currentQuestion._id,
-          new Types.ObjectId(userId)
-        );
-
-        io.emit("quiz:winner", {
-          userId,
-          username,
-          round: currentRound,
-          correctAnswer,
-          reward: currentQuestion.reward_amount || 0,
-          exp: newExp,
-          waitTime: WAIT_DURATION,
-          message: `${username} won Round ${currentRound}! 🎉`,
-        });
-
-        io.emit("players:update", onlineUsers);
-
-        if (roundTimeout) {
-          clearTimeout(roundTimeout);
-          roundTimeout = null;
+        if (!resultTimeout) {
+          resultTimeout = setTimeout(() => {
+            emitResults();
+          }, RESULT_DELAY * 1000);
         }
-        currentQuestion = null;
-        submissions = {};
-
-        startWaitingPeriod(false); // silent wait
       }
     } catch (err) {
       console.error("❌ Error in quiz:answer:", err);
@@ -352,9 +308,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  /**
-   * Disconnect
-   */
   socket.on("disconnect", () => {
     onlineUsers = onlineUsers.filter((u) => u.socketId !== socket.id);
     io.emit("players:update", onlineUsers);
@@ -364,13 +317,16 @@ io.on("connection", (socket) => {
     if (realUsers.length < 1) {
       if (roundTimeout) clearTimeout(roundTimeout);
       if (waitTimeout) clearTimeout(waitTimeout);
+      if (resultTimeout) clearTimeout(resultTimeout);
       roundTimeout = null;
       waitTimeout = null;
+      resultTimeout = null;
       currentQuestion = null;
       submissions = {};
       questionStartTime = null;
       waitStartTime = null;
       winnerDeclared = false;
+      firstCorrectUser = null;
 
       io.emit("quiz:stopped", {
         message: "Not enough real players. Waiting for more to join...",
@@ -379,9 +335,85 @@ io.on("connection", (socket) => {
   });
 });
 
-/**
- * HELPERS
- */
+async function emitResults() {
+  if (!currentQuestion) return;
+
+  const correctAnswer = currentQuestion?.answer;
+  if (!correctAnswer) return;
+
+  for (const u of onlineUsers) {
+    const submitted = submissions[u.userId];
+
+    if (!submitted) {
+      io.to(u.socketId).emit("quiz:end", {
+        round: currentRound,
+        correctAnswer,
+        waitTime: WAIT_DURATION,
+        message: "⏰ No response submitted.",
+      });
+    } else if (submitted.trim().toLowerCase() === correctAnswer.toLowerCase()) {
+      if (firstCorrectUser && u.userId === firstCorrectUser.userId) {
+        const rewardedUser = await gameService.addBalance(
+          new Types.ObjectId(u.userId),
+          currentQuestion.reward_amount || 0
+        );
+        const newExp = await gameService.updateExp(
+          u.userId,
+          (rewardedUser!.exp ?? 0) + 1
+        );
+
+        onlineUsers = onlineUsers.map((usr) =>
+          usr.userId === u.userId ? { ...usr, exp: newExp } : usr
+        );
+
+        await gameService.markAnswered(
+          currentQuestion?._id,
+          new Types.ObjectId(u.userId)
+        );
+
+        io.to(u.socketId).emit("quiz:winner", {
+          userId: u.userId,
+          username: u.username,
+          round: currentRound,
+          correctAnswer,
+          reward: currentQuestion.reward_amount || 0,
+          exp: newExp,
+          waitTime: WAIT_DURATION,
+          message: `${u.username} won Round ${currentRound}! 🎉`,
+        });
+      } else {
+        io.to(u.socketId).emit("quiz:end", {
+          round: currentRound,
+          correctAnswer,
+          waitTime: WAIT_DURATION,
+          message: "✅ Correct, but not the fastest!",
+        });
+      }
+    } else {
+      io.to(u.socketId).emit("quiz:end", {
+        round: currentRound,
+        correctAnswer,
+        waitTime: WAIT_DURATION,
+        message: "❌ Wrong answer!",
+      });
+    }
+  }
+
+  io.emit("players:update", onlineUsers);
+
+  if (roundTimeout) clearTimeout(roundTimeout);
+  roundTimeout = null;
+  if (resultTimeout) clearTimeout(resultTimeout);
+  resultTimeout = null;
+
+  currentQuestion = null;
+  submissions = {};
+  firstCorrectUser = null;
+  winnerDeclared = true;
+
+  startWaitingPeriod(false);
+}
+
 function startWaitingPeriod(emitToAll = false) {
   if (waitTimeout) clearTimeout(waitTimeout);
 
@@ -423,6 +455,7 @@ async function startNewQuestion() {
     currentQuestion = q;
     questionStartTime = Date.now();
     submissions = {};
+    firstCorrectUser = null;
 
     io.emit("quiz:question", {
       round: currentRound,
@@ -440,32 +473,7 @@ async function startNewQuestion() {
       roundTimeout = null;
 
       if (!winnerDeclared && currentQuestion) {
-        onlineUsers.forEach((u) => {
-          const submitted = submissions[u.userId];
-          if (!submitted) {
-            io.to(u.socketId).emit("quiz:end", {
-              round: currentRound,
-              correctAnswer: currentQuestion.answer,
-              waitTime: WAIT_DURATION,
-              message: "⏰ No response submitted.",
-            });
-          } else if (
-            submitted.trim().toLowerCase() !==
-            currentQuestion.answer.toLowerCase()
-          ) {
-            io.to(u.socketId).emit("quiz:end", {
-              round: currentRound,
-              correctAnswer: currentQuestion.answer,
-              waitTime: WAIT_DURATION,
-              message: "❌ Wrong answer!",
-            });
-          }
-        });
-
-        currentQuestion = null;
-        submissions = {};
-
-        startWaitingPeriod(false);
+        emitResults();
       }
     }, QUESTION_DURATION * 1000);
   } catch (err) {
