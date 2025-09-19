@@ -170,7 +170,7 @@ let waitStartTime: number | null = null;
 
 const QUESTION_DURATION = 30; // seconds
 const WAIT_DURATION = 30; // seconds
-const RESULT_DELAY = 10; // seconds (after first correct answer)
+const RESULT_DELAY = 10; // seconds
 
 let roundTimeout: NodeJS.Timeout | null = null;
 let waitTimeout: NodeJS.Timeout | null = null;
@@ -341,6 +341,55 @@ async function emitResults() {
   const correctAnswer = currentQuestion?.answer;
   if (!correctAnswer) return;
 
+  let winnerInfo: {
+    userId: string;
+    username: string;
+    reward: number;
+    exp: number;
+  } | null = null;
+
+  if (firstCorrectUser) {
+    const winnerUser = onlineUsers.find(
+      (u) => u.userId === firstCorrectUser!.userId
+    );
+
+    if (winnerUser) {
+      const rewardedUser = await gameService.addBalance(
+        new Types.ObjectId(winnerUser.userId),
+        currentQuestion.reward_amount || 0
+      );
+
+      const newExp = await gameService.updateExp(
+        winnerUser.userId,
+        (rewardedUser!.exp ?? 0) + 1
+      );
+
+      onlineUsers = onlineUsers.map((usr) =>
+        usr.userId === winnerUser.userId ? { ...usr, exp: newExp } : usr
+      );
+
+      await gameService.markAnswered(
+        currentQuestion?._id,
+        new Types.ObjectId(winnerUser.userId)
+      );
+
+      winnerInfo = {
+        userId: winnerUser.userId,
+        username: winnerUser.username,
+        reward: currentQuestion.reward_amount || 0,
+        exp: newExp,
+      };
+
+      io.to(winnerUser.socketId).emit("quiz:winner", {
+        ...winnerInfo,
+        round: currentRound,
+        correctAnswer,
+        waitTime: WAIT_DURATION,
+        message: `${winnerUser.username} won Round ${currentRound}! 🎉`,
+      });
+    }
+  }
+
   for (const u of onlineUsers) {
     const submitted = submissions[u.userId];
 
@@ -350,43 +399,18 @@ async function emitResults() {
         correctAnswer,
         waitTime: WAIT_DURATION,
         message: "⏰ No response submitted.",
+        winner: winnerInfo,
       });
     } else if (submitted.trim().toLowerCase() === correctAnswer.toLowerCase()) {
       if (firstCorrectUser && u.userId === firstCorrectUser.userId) {
-        const rewardedUser = await gameService.addBalance(
-          new Types.ObjectId(u.userId),
-          currentQuestion.reward_amount || 0
-        );
-        const newExp = await gameService.updateExp(
-          u.userId,
-          (rewardedUser!.exp ?? 0) + 1
-        );
-
-        onlineUsers = onlineUsers.map((usr) =>
-          usr.userId === u.userId ? { ...usr, exp: newExp } : usr
-        );
-
-        await gameService.markAnswered(
-          currentQuestion?._id,
-          new Types.ObjectId(u.userId)
-        );
-
-        io.to(u.socketId).emit("quiz:winner", {
-          userId: u.userId,
-          username: u.username,
-          round: currentRound,
-          correctAnswer,
-          reward: currentQuestion.reward_amount || 0,
-          exp: newExp,
-          waitTime: WAIT_DURATION,
-          message: `${u.username} won Round ${currentRound}! 🎉`,
-        });
+        continue;
       } else {
         io.to(u.socketId).emit("quiz:end", {
           round: currentRound,
           correctAnswer,
           waitTime: WAIT_DURATION,
           message: "✅ Correct, but not the fastest!",
+          winner: winnerInfo,
         });
       }
     } else {
@@ -395,6 +419,7 @@ async function emitResults() {
         correctAnswer,
         waitTime: WAIT_DURATION,
         message: "❌ Wrong answer!",
+        winner: winnerInfo,
       });
     }
   }
