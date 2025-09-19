@@ -43,7 +43,7 @@ let waitStartTime: number | null = null;
 
 const QUESTION_DURATION = 30; // seconds
 const WAIT_DURATION = 30; // seconds
-const RESULT_DELAY = 10; // seconds
+const RESULT_DELAY = 15; // seconds
 
 let roundTimeout: NodeJS.Timeout | null = null;
 let waitTimeout: NodeJS.Timeout | null = null;
