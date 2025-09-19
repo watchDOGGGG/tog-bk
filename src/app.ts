@@ -336,7 +336,7 @@ async function startNewQuestion() {
 
   try {
     const realUsers = onlineUsers.filter((u) => !u.isBot);
-    if (realUsers.length < 1) {
+    if (realUsers.length < 2) {
       startingQuestion = false;
       return;
     }
