@@ -85,9 +85,9 @@ io.on("connection", (socket) => {
       }
 
       console.log("✅ Current online users:", onlineUsers);
-
       io.emit("players:update", onlineUsers);
 
+      // If there is an active question, sync it to the joining player
       if (currentQuestion && questionStartTime) {
         const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
         const timeLeft = Math.max(0, QUESTION_DURATION - elapsed);
@@ -104,6 +104,7 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // If we’re in waiting state, sync it
       if (waitStartTime) {
         const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
         const timeLeft = Math.max(0, WAIT_DURATION - elapsed);
@@ -113,14 +114,15 @@ io.on("connection", (socket) => {
         }
       }
 
+      // Start the game only if at least 2 real users are online
       const realUsers = onlineUsers.filter((u) => !u.isBot);
       if (
-        realUsers.length === 1 &&
+        realUsers.length >= 2 &&
         !waitTimeout &&
         !roundTimeout &&
         !currentQuestion
       ) {
-        console.log("🚀 First real user joined. Starting waiting period...");
+        console.log("🚀 Enough players joined. Starting waiting period...");
         startWaitingPeriod(true);
         return;
       }
@@ -315,19 +317,15 @@ async function emitResults() {
 function startWaitingPeriod(emitToAll = false) {
   if (waitTimeout) clearTimeout(waitTimeout);
 
-  const realUsers = onlineUsers.filter((u) => !u.isBot);
-  if (realUsers.length < 2) {
-    console.log("⚠️ Not enough players to start waiting period.");
-    return; // ✅ Prevents game from starting with 1 user
-  }
-
   waitStartTime = Date.now();
+  console.log(`⏳ Waiting period started (${WAIT_DURATION}s)`);
 
   if (emitToAll) {
     io.emit("quiz:waiting", { timeLeft: WAIT_DURATION });
   }
 
   waitTimeout = setTimeout(() => {
+    console.log("⏰ Waiting finished, starting new question...");
     waitTimeout = null;
     waitStartTime = null;
     startNewQuestion().catch((err) =>
@@ -343,7 +341,7 @@ async function startNewQuestion() {
   try {
     const realUsers = onlineUsers.filter((u) => !u.isBot);
     if (realUsers.length < 2) {
-      console.log("⚠️ Not enough players to start a new question.");
+      console.log("⚠️ Not enough players to start a question.");
       startingQuestion = false;
       return;
     }
@@ -361,6 +359,8 @@ async function startNewQuestion() {
     questionStartTime = Date.now();
     submissions = {};
     firstCorrectUser = null;
+
+    console.log(`📝 Starting Round ${currentRound}: ${q.question}`);
 
     io.emit("quiz:question", {
       round: currentRound,
