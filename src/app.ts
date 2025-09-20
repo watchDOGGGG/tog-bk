@@ -33,7 +33,15 @@ let onlineUsers: {
   exp: number;
   socketId: string;
   isBot?: boolean;
-}[] = [];
+}[] = [
+  {
+    userId: "bot-001",
+    username: "@jose_ph1",
+    exp: 0,
+    socketId: "bot-socket",
+    isBot: true,
+  },
+];
 
 let currentRound = 0;
 let currentQuestion: any = null;
@@ -87,7 +95,7 @@ io.on("connection", (socket) => {
       console.log("✅ Current online users:", onlineUsers);
       io.emit("players:update", onlineUsers);
 
-      // If there is an active question, sync it to the joining player
+      // If there is an active question, sync it
       if (currentQuestion && questionStartTime) {
         const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
         const timeLeft = Math.max(0, QUESTION_DURATION - elapsed);
@@ -104,7 +112,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // If we’re in waiting state, sync it
+      // If in waiting state, sync it
       if (waitStartTime) {
         const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
         const timeLeft = Math.max(0, WAIT_DURATION - elapsed);
@@ -114,7 +122,7 @@ io.on("connection", (socket) => {
         }
       }
 
-      // Start the game only if at least 2 real users are online
+      // Start game only if ≥ 2 real users
       const realUsers = onlineUsers.filter((u) => !u.isBot);
       if (
         realUsers.length >= 2 &&
@@ -142,22 +150,26 @@ io.on("connection", (socket) => {
       const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
       if (elapsed >= QUESTION_DURATION) return;
 
-      const updatedUser = await gameService.useToken(
-        new Types.ObjectId(userId),
-        1
-      );
-      if (!updatedUser) {
-        io.to(socket.id).emit("quiz:error", {
-          message: "User not found or insufficient tokens",
-        });
-        return;
-      }
+      // Skip bot from real token usage
+      const isBot = onlineUsers.find((u) => u.userId === userId)?.isBot;
+      if (!isBot) {
+        const updatedUser = await gameService.useToken(
+          new Types.ObjectId(userId),
+          1
+        );
+        if (!updatedUser) {
+          io.to(socket.id).emit("quiz:error", {
+            message: "User not found or insufficient tokens",
+          });
+          return;
+        }
 
-      io.to(socket.id).emit("quiz:userUpdate", {
-        tokens: updatedUser.tokens,
-        balance: updatedUser.balance,
-        exp: updatedUser.exp,
-      });
+        io.to(socket.id).emit("quiz:userUpdate", {
+          tokens: updatedUser.tokens,
+          balance: updatedUser.balance,
+          exp: updatedUser.exp,
+        });
+      }
 
       submissions[userId] = answer.trim();
 
@@ -184,7 +196,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    onlineUsers = onlineUsers.filter((u) => u.socketId !== socket.id);
+    onlineUsers = onlineUsers.filter(
+      (u) => u.socketId !== socket.id || u.isBot
+    );
     io.emit("players:update", onlineUsers);
 
     const realUsers = onlineUsers.filter((u) => !u.isBot);
@@ -229,31 +243,41 @@ async function emitResults() {
     );
 
     if (winnerUser) {
-      const rewardedUser = await gameService.addBalance(
-        new Types.ObjectId(winnerUser.userId),
-        currentQuestion.reward_amount || 0
-      );
+      if (!winnerUser.isBot) {
+        const rewardedUser = await gameService.addBalance(
+          new Types.ObjectId(winnerUser.userId),
+          currentQuestion.reward_amount || 0
+        );
 
-      const newExp = await gameService.updateExp(
-        winnerUser.userId,
-        (rewardedUser!.exp ?? 0) + 1
-      );
+        const newExp = await gameService.updateExp(
+          winnerUser.userId,
+          (rewardedUser!.exp ?? 0) + 1
+        );
 
-      onlineUsers = onlineUsers.map((usr) =>
-        usr.userId === winnerUser.userId ? { ...usr, exp: newExp } : usr
-      );
+        onlineUsers = onlineUsers.map((usr) =>
+          usr.userId === winnerUser.userId ? { ...usr, exp: newExp } : usr
+        );
 
-      await gameService.markAnswered(
-        currentQuestion?._id,
-        new Types.ObjectId(winnerUser.userId)
-      );
+        await gameService.markAnswered(
+          currentQuestion?._id,
+          new Types.ObjectId(winnerUser.userId)
+        );
 
-      winnerInfo = {
-        userId: winnerUser.userId,
-        username: winnerUser.username,
-        reward: currentQuestion.reward_amount || 0,
-        exp: newExp,
-      };
+        winnerInfo = {
+          userId: winnerUser.userId,
+          username: winnerUser.username,
+          reward: currentQuestion.reward_amount || 0,
+          exp: newExp,
+        };
+      } else {
+        // Bot winner (no DB)
+        winnerInfo = {
+          userId: winnerUser.userId,
+          username: winnerUser.username,
+          reward: currentQuestion.reward_amount || 0,
+          exp: winnerUser.exp + 1,
+        };
+      }
 
       io.to(winnerUser.socketId).emit("quiz:winner", {
         ...winnerInfo,
@@ -266,6 +290,8 @@ async function emitResults() {
   }
 
   for (const u of onlineUsers) {
+    if (u.isBot) continue; // Skip bot for end messages
+
     const submitted = submissions[u.userId];
 
     if (!submitted) {
@@ -340,7 +366,9 @@ async function startNewQuestion() {
 
   try {
     const realUsers = onlineUsers.filter((u) => !u.isBot);
-    if (realUsers.length < 2) {
+    const botUser = onlineUsers.find((u) => u.isBot);
+
+    if (realUsers.length < 2 && !botUser) {
       console.log("⚠️ Not enough players to start a question.");
       startingQuestion = false;
       return;
@@ -371,6 +399,31 @@ async function startNewQuestion() {
       reward_amount: q.reward_amount,
       timeLeft: QUESTION_DURATION,
     });
+
+    // 🤖 Bot logic
+    if (botUser) {
+      const difficulty = q.difficulty?.toLowerCase();
+
+      let shouldBotAnswer =
+        difficulty === "hard" ||
+        difficulty === "medium" ||
+        (difficulty === "easy" && Math.random() < 0.3); // 30% chance for easy
+
+      if (shouldBotAnswer) {
+        console.log(`🤖 Bot ${botUser.username} auto-answered correctly!`);
+
+        firstCorrectUser = {
+          userId: botUser.userId,
+          username: botUser.username,
+        };
+
+        if (!resultTimeout) {
+          resultTimeout = setTimeout(() => {
+            emitResults();
+          }, RESULT_DELAY * 1000);
+        }
+      }
+    }
 
     if (roundTimeout) clearTimeout(roundTimeout);
 
