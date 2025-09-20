@@ -315,6 +315,12 @@ async function emitResults() {
 function startWaitingPeriod(emitToAll = false) {
   if (waitTimeout) clearTimeout(waitTimeout);
 
+  const realUsers = onlineUsers.filter((u) => !u.isBot);
+  if (realUsers.length < 2) {
+    console.log("⚠️ Not enough players to start waiting period.");
+    return; // ✅ Prevents game from starting with 1 user
+  }
+
   waitStartTime = Date.now();
 
   if (emitToAll) {
@@ -337,6 +343,7 @@ async function startNewQuestion() {
   try {
     const realUsers = onlineUsers.filter((u) => !u.isBot);
     if (realUsers.length < 2) {
+      console.log("⚠️ Not enough players to start a new question.");
       startingQuestion = false;
       return;
     }
