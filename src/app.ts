@@ -287,6 +287,76 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ---------------- pickarow:play ----------------
+  socket.on("pickarow:play", async ({ userId, userRow, stakeTokens }) => {
+    try {
+      // Validate input
+      if (!userId || !userRow || !stakeTokens) {
+        return io
+          .to(socket.id)
+          .emit("quiz:error", { message: "Invalid play request" });
+      }
+      if (userRow < 1 || userRow > 6) {
+        return io
+          .to(socket.id)
+          .emit("quiz:error", { message: "Row must be 1–6" });
+      }
+
+      // Fetch user
+      const user = await gameService.getUserById(new Types.ObjectId(userId));
+      if (!user)
+        return io
+          .to(socket.id)
+          .emit("quiz:error", { message: "User not found" });
+      if (user.tokens < stakeTokens)
+        return io
+          .to(socket.id)
+          .emit("quiz:error", { message: "Insufficient tokens" });
+
+      // Deduct staked tokens immediately
+      const updatedUser = await gameService.useToken(
+        new Types.ObjectId(userId),
+        stakeTokens
+      );
+      io.to(socket.id).emit("pickarow:update", {
+        tokens: updatedUser!.tokens,
+        balance: updatedUser!.balance,
+      });
+
+      // ---------------- Random winning row (pure random) ----------------
+      const winningRow = Math.floor(Math.random() * 6) + 1; // 1–6, each equally likely
+
+      // 1-second suspense before showing result
+      setTimeout(async () => {
+        const userWon = userRow === winningRow;
+        let rewardAmount = 0;
+
+        if (userWon) {
+          rewardAmount = stakeTokens * 150;
+          await gameService.addBalance(
+            new Types.ObjectId(userId),
+            rewardAmount
+          );
+        }
+
+        // Emit result to user only
+        io.to(socket.id).emit("pickarow:result", {
+          winningRow,
+          userRow,
+          userWon,
+          rewardAmount,
+          balance: updatedUser!.balance + rewardAmount,
+          tokens: updatedUser!.tokens,
+        });
+      }, 1000);
+    } catch (err) {
+      console.error("❌ Error in pickarow:play:", err);
+      io.to(socket.id).emit("quiz:error", {
+        message: "Failed to play Pick a Row",
+      });
+    }
+  });
+
   // ---------------- quiz:answer ----------------
   // Keep original logic semantics, but only accept answers from trivia room participants.
   socket.on("quiz:answer", async ({ userId, username, answer }) => {
