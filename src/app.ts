@@ -38,9 +38,9 @@ let onlineUsers: {
   { userId: "demo-001", username: "Alice", exp: 5, socketId: "" },
   { userId: "demo-002", username: "Bob", exp: 3, socketId: "" },
   { userId: "demo-003", username: "Charlie", exp: 2, socketId: "" },
-  { userId: "demo-003", username: "mercy25", exp: 3, socketId: "" },
-  { userId: "demo-003", username: "_David_", exp: 26, socketId: "" },
-  { userId: "demo-003", username: "_David_", exp: 12, socketId: "" },
+  { userId: "demo-004", username: "mercy25", exp: 3, socketId: "" },
+  { userId: "demo-005", username: "_David_", exp: 26, socketId: "" },
+  { userId: "demo-006", username: "austin@fx", exp: 12, socketId: "" },
 ];
 
 // Available game rooms
