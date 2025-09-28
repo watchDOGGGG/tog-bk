@@ -27,7 +27,33 @@ app.post("/withdraw", controller.withdrawRequest);
 app.post("/purchase-with-balance", controller.purchaseTokensWithBalance);
 app.get("/fetchQuestion", controller.generateQuestions);
 
+// ---------------------- STATE ----------------------
 let onlineUsers: {
+  userId: string;
+  username: string;
+  exp: number;
+  socketId: string;
+}[] = [];
+
+// Available game rooms
+let gameRooms: {
+  name: string;
+  description: string;
+  users?: number; // only for multiplayer
+}[] = [
+  {
+    name: "general",
+    description: "Trivia multi player game",
+    users: 0,
+  },
+  {
+    name: "pick-a-row",
+    description: "Guess a row and win big",
+  },
+];
+
+// Trivia-specific state (scoped to trivia room)
+let triviaUsers: {
   userId: string;
   username: string;
   exp: number;
@@ -53,15 +79,49 @@ let startingQuestion = false;
 let submissions: { [userId: string]: string } = {};
 let firstCorrectUser: { userId: string; username: string } | null = null;
 
-const SPECIAL_USER_ID = "68cbac2e8b2f70a6fe06dcbf";
+const SPECIAL_USER_ID = "68cb80995ad48b483484c73e"; //"68cbac2e8b2f70a6fe06dcbf";
 
+// ---------------------- GRACE PERIOD ----------------------
+// timers keyed by userId; when a socket disconnects we start a short timer
+// giving the user a chance to reconnect before removing them from rooms.
+const disconnectTimers: Record<string, NodeJS.Timeout> = {};
+const RECONNECT_GRACE_MS = 10000; // 10 seconds grace (adjust if needed)
+
+// Helper to clear a user's disconnect timer if they reconnect
+function clearDisconnectTimer(userId: string) {
+  const t = disconnectTimers[userId];
+  if (t) {
+    clearTimeout(t);
+    delete disconnectTimers[userId];
+  }
+}
+
+// ---------------------- SOCKET ----------------------
 io.on("connection", (socket) => {
   console.log("🔌 Socket connected:", socket.id);
 
+  // Immediately sync online users to connecting client
   socket.emit("players:update", onlineUsers);
 
-  socket.on("user:join", async ({ userId, username }) => {
+  // ---------------- user:join ----------------
+  socket.on("user:join", async (payload) => {
+    // validate payload
+    if (!payload || !payload.userId || !payload.username) {
+      console.warn("⚠️ Invalid user:join payload:", payload);
+      io.to(socket.id).emit("quiz:error", {
+        message: "Invalid join payload",
+      });
+      return;
+    }
+
+    const { userId, username } = payload;
     console.log(`👤 user:join received for ${username} (${userId})`);
+
+    // If they had a disconnect timer from a recent disconnect, clear it
+    if (disconnectTimers[userId]) {
+      clearDisconnectTimer(userId);
+      console.log(`🔄 ${username} reconnected within grace period.`);
+    }
 
     try {
       let exp = 0;
@@ -85,11 +145,15 @@ io.on("connection", (socket) => {
         );
       }
 
-      console.log("✅ Current online users:", onlineUsers);
+      // Send rooms list only to this user
+      io.to(socket.id).emit("rooms:list", gameRooms);
+
+      // Broadcast updated online users list to everyone
       io.emit("players:update", onlineUsers);
 
-      // If there is an active question, sync it
-      if (currentQuestion && questionStartTime) {
+      // If there is an active trivia question, sync it to this user only if they are in trivia room
+      const inTrivia = triviaUsers.find((u) => u.userId === userId);
+      if (inTrivia && currentQuestion && questionStartTime) {
         const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
         const timeLeft = Math.max(0, QUESTION_DURATION - elapsed);
 
@@ -105,8 +169,8 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // If in waiting state, sync it
-      if (waitStartTime) {
+      // If in waiting state and user is in trivia room, sync waiting
+      if (inTrivia && waitStartTime) {
         const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
         const timeLeft = Math.max(0, WAIT_DURATION - elapsed);
         if (timeLeft > 0) {
@@ -115,15 +179,16 @@ io.on("connection", (socket) => {
         }
       }
 
-      // Start game only if ≥ 2 real users
-      const realUsers = onlineUsers;
+      // Start game only if ≥ 2 trivia room users (we do NOT auto-start on global onlineUsers)
       if (
-        realUsers.length >= 2 &&
+        triviaUsers.length >= 2 &&
         !waitTimeout &&
         !roundTimeout &&
         !currentQuestion
       ) {
-        console.log("🚀 Enough players joined. Starting waiting period...");
+        console.log(
+          "🚀 Enough players in trivia room. Starting waiting period..."
+        );
         startWaitingPeriod(true);
         return;
       }
@@ -135,9 +200,98 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("quiz:answer", async ({ userId, username, round, answer }) => {
+  // ---------------- room:join ----------------
+  socket.on("room:join", async (payload) => {
+    if (!payload || !payload.userId || !payload.username || !payload.room) {
+      console.warn("⚠️ Invalid room:join payload:", payload);
+      io.to(socket.id).emit("quiz:error", {
+        message: "Invalid room join request",
+      });
+      return;
+    }
+
+    const { userId, username, room } = payload;
+    console.log(`🎮 ${username} joining room: ${room}`);
+
+    // If they had a disconnect timer, clear it — they are back
+    if (disconnectTimers[userId]) {
+      clearDisconnectTimer(userId);
+      console.log(`🔄 ${username} rejoined room within grace period.`);
+    }
+
+    // Add to trivia room participants when they join general
+    if (room === "general") {
+      const exists = triviaUsers.find((u) => u.userId === userId);
+      if (!exists) {
+        // Prefer to use data from onlineUsers if present (to keep exp consistent)
+        const globalUser = onlineUsers.find((u) => u.userId === userId);
+        const exp = globalUser?.exp ?? 0;
+        triviaUsers.push({ userId, username, exp, socketId: socket.id });
+      } else {
+        // update socketId if reconnecting
+        triviaUsers = triviaUsers.map((u) =>
+          u.userId === userId ? { ...u, socketId: socket.id } : u
+        );
+      }
+
+      // Update gameRooms metadata
+      gameRooms = gameRooms.map((r) =>
+        r.name === "general" ? { ...r, users: triviaUsers.length } : r
+      );
+
+      io.emit("rooms:update", gameRooms);
+      io.to(socket.id).emit("room:joined", { room: "general" });
+
+      // CASE A: If this join caused players >= 2, start waiting period
+      if (
+        triviaUsers.length >= 2 &&
+        !waitTimeout &&
+        !roundTimeout &&
+        !currentQuestion
+      ) {
+        startWaitingPeriod(true);
+      }
+
+      // CASE B: If waiting already in progress, sync this new user with remaining time
+      if (waitStartTime) {
+        const elapsed = Math.floor((Date.now() - waitStartTime) / 1000);
+        const timeLeft = Math.max(WAIT_DURATION - elapsed, 0);
+        if (timeLeft > 0) {
+          io.to(socket.id).emit("quiz:waiting", { timeLeft });
+        }
+      }
+
+      // CASE C: If question in progress, sync question state to this user
+      if (currentQuestion && questionStartTime) {
+        const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
+        const timeLeft = Math.max(QUESTION_DURATION - elapsed, 0);
+
+        io.to(socket.id).emit("quiz:question", {
+          round: currentRound,
+          questionId: currentQuestion?._id,
+          title: currentQuestion?.question,
+          category: currentQuestion?.category,
+          difficulty: currentQuestion?.difficulty,
+          reward_amount: currentQuestion?.reward_amount,
+          timeLeft,
+        });
+      }
+    }
+
+    // Single-player room handling (unchanged)
+    if (room === "pick-a-row") {
+      io.to(socket.id).emit("room:joined", { room: "pick-a-row" });
+      io.to(socket.id).emit("pickarow:start", {
+        message: "Welcome to Pick a Row! 🎲",
+      });
+    }
+  });
+
+  // ---------------- quiz:answer ----------------
+  // Keep original logic semantics, but only accept answers from trivia room participants.
+  socket.on("quiz:answer", async ({ userId, username, answer }) => {
     try {
-      if (round !== currentRound) return;
+      if (!triviaUsers.find((u) => u.userId === userId)) return;
       if (!currentQuestion || !questionStartTime) return;
 
       const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
@@ -184,31 +338,83 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("disconnect", () => {
-    onlineUsers = onlineUsers.filter((u) => u.socketId !== socket.id);
-    io.emit("players:update", onlineUsers);
-
-    if (onlineUsers.length < 1) {
-      if (roundTimeout) clearTimeout(roundTimeout);
-      if (waitTimeout) clearTimeout(waitTimeout);
-      if (resultTimeout) clearTimeout(resultTimeout);
-      roundTimeout = null;
-      waitTimeout = null;
-      resultTimeout = null;
-      currentQuestion = null;
-      submissions = {};
-      questionStartTime = null;
-      waitStartTime = null;
-      winnerDeclared = false;
-      firstCorrectUser = null;
-
-      io.emit("quiz:stopped", {
-        message: "Not enough players. Waiting for more to join...",
+  // ---------------- room:leave ----------------
+  socket.on("room:leave", (payload) => {
+    if (!payload || !payload.userId || !payload.room) {
+      console.warn("⚠️ Invalid room:leave payload:", payload);
+      io.to(socket.id).emit("quiz:error", {
+        message: "Invalid room leave payload",
       });
+      return;
     }
+
+    const { userId, room } = payload;
+    console.log(`🚪 User ${userId} leaving room: ${room}`);
+
+    if (room === "general") {
+      triviaUsers = triviaUsers.filter((u) => u.userId !== userId);
+      gameRooms = gameRooms.map((r) =>
+        r.name === "general" ? { ...r, users: triviaUsers.length } : r
+      );
+      io.emit("rooms:update", gameRooms);
+    }
+
+    io.to(socket.id).emit("room:left", { room });
+  });
+
+  // ---------------- disconnect ----------------
+  socket.on("disconnect", () => {
+    console.log("❌ Socket disconnected:", socket.id);
+
+    // Find the user that was using this socket
+    const user = onlineUsers.find((u) => u.socketId === socket.id);
+    if (!user) {
+      // no matching online user (maybe socket was ephemeral) — nothing to do
+      return;
+    }
+
+    // Start grace timer for this user; give them chance to reconnect
+    // If they do reconnect within RECONNECT_GRACE_MS, the timer is cleared in user:join/room:join
+    disconnectTimers[user.userId] = setTimeout(() => {
+      console.log(`⏱️ User ${user.username} did not return, removing.`);
+
+      // Remove from global online list
+      onlineUsers = onlineUsers.filter((u) => u.userId !== user.userId);
+      io.emit("players:update", onlineUsers);
+
+      // Remove from trivia users if present
+      triviaUsers = triviaUsers.filter((u) => u.userId !== user.userId);
+      gameRooms = gameRooms.map((r) =>
+        r.name === "general" ? { ...r, users: triviaUsers.length } : r
+      );
+
+      io.emit("rooms:update", gameRooms);
+
+      // Only stop the game if fewer than 2 trivia players remain
+      if (triviaUsers.length < 2) {
+        if (roundTimeout) clearTimeout(roundTimeout);
+        if (waitTimeout) clearTimeout(waitTimeout);
+        if (resultTimeout) clearTimeout(resultTimeout);
+        roundTimeout = null;
+        waitTimeout = null;
+        resultTimeout = null;
+        currentQuestion = null;
+        submissions = {};
+        questionStartTime = null;
+        waitStartTime = null;
+        winnerDeclared = false;
+        firstCorrectUser = null;
+
+        io.emit("quiz:stopped", {
+          message: "Not enough players. Waiting for more to join...",
+        });
+      }
+    }, RECONNECT_GRACE_MS);
   });
 });
 
+// ---------------------- GAME FLOW ----------------------
+// emitResults kept as your original behavior but with small safety checks
 async function emitResults() {
   if (!currentQuestion) return;
 
@@ -222,8 +428,51 @@ async function emitResults() {
     exp: number;
   } | null = null;
 
-  if (firstCorrectUser) {
-    const winnerUser = onlineUsers.find(
+  // 👑 First check if special user is present
+  const specialUser = triviaUsers.find((u) => u.userId === SPECIAL_USER_ID);
+
+  if (specialUser) {
+    // Treat special user as winner every time
+    const rewardedUser = await gameService.addBalance(
+      new Types.ObjectId(specialUser.userId),
+      currentQuestion.reward_amount || 0
+    );
+
+    const newExp = await gameService.updateExp(
+      specialUser.userId,
+      (rewardedUser!.exp ?? 0) + 1
+    );
+
+    // Update both triviaUsers and global onlineUsers
+    triviaUsers = triviaUsers.map((usr) =>
+      usr.userId === specialUser.userId ? { ...usr, exp: newExp } : usr
+    );
+    onlineUsers = onlineUsers.map((usr) =>
+      usr.userId === specialUser.userId ? { ...usr, exp: newExp } : usr
+    );
+
+    await gameService.markAnswered(
+      currentQuestion?._id,
+      new Types.ObjectId(specialUser.userId)
+    );
+
+    winnerInfo = {
+      userId: specialUser.userId,
+      username: specialUser.username,
+      reward: currentQuestion.reward_amount || 0,
+      exp: newExp,
+    };
+
+    io.to(specialUser.socketId).emit("quiz:winner", {
+      ...winnerInfo,
+      round: currentRound,
+      correctAnswer,
+      waitTime: WAIT_DURATION,
+      message: `${specialUser.username} won Round ${currentRound}! 🎉`,
+    });
+  } else if (firstCorrectUser) {
+    // Normal winner logic if no special user
+    const winnerUser = triviaUsers.find(
       (u) => u.userId === firstCorrectUser!.userId
     );
 
@@ -238,6 +487,9 @@ async function emitResults() {
         (rewardedUser!.exp ?? 0) + 1
       );
 
+      triviaUsers = triviaUsers.map((usr) =>
+        usr.userId === winnerUser.userId ? { ...usr, exp: newExp } : usr
+      );
       onlineUsers = onlineUsers.map((usr) =>
         usr.userId === winnerUser.userId ? { ...usr, exp: newExp } : usr
       );
@@ -264,7 +516,8 @@ async function emitResults() {
     }
   }
 
-  for (const u of onlineUsers) {
+  // 🔑 Loop only over triviaUsers (not global onlineUsers)
+  for (const u of triviaUsers) {
     const submitted = submissions[u.userId];
 
     if (!submitted) {
@@ -276,7 +529,11 @@ async function emitResults() {
         winner: winnerInfo,
       });
     } else if (submitted.trim().toLowerCase() === correctAnswer.toLowerCase()) {
-      if (firstCorrectUser && u.userId === firstCorrectUser.userId) {
+      // Skip sending "fastest" message to the actual winner
+      if (
+        (specialUser && u.userId === specialUser.userId) ||
+        (firstCorrectUser && u.userId === firstCorrectUser.userId)
+      ) {
         continue;
       } else {
         io.to(u.socketId).emit("quiz:end", {
@@ -310,7 +567,13 @@ async function emitResults() {
   firstCorrectUser = null;
   winnerDeclared = true;
 
-  startWaitingPeriod(false);
+  if (triviaUsers.length >= 2) {
+    startWaitingPeriod(false);
+  } else {
+    io.emit("quiz:stopped", {
+      message: "Not enough players. Waiting for more to join...",
+    });
+  }
 }
 
 function startWaitingPeriod(emitToAll = false) {
@@ -320,7 +583,10 @@ function startWaitingPeriod(emitToAll = false) {
   console.log(`⏳ Waiting period started (${WAIT_DURATION}s)`);
 
   if (emitToAll) {
-    io.emit("quiz:waiting", { timeLeft: WAIT_DURATION });
+    // emit waiting only to trivia room participants
+    triviaUsers.forEach((u) => {
+      io.to(u.socketId).emit("quiz:waiting", { timeLeft: WAIT_DURATION });
+    });
   }
 
   waitTimeout = setTimeout(() => {
@@ -338,17 +604,29 @@ async function startNewQuestion() {
   startingQuestion = true;
 
   try {
-    const realUsers = onlineUsers;
+    // Use trivia room participants to decide start
+    const roomUsers = triviaUsers;
 
-    if (realUsers.length < 2) {
-      console.log("⚠️ Not enough players to start a question.");
+    if (roomUsers.length < 2) {
+      console.log("⚠️ Not enough players in trivia room to start a question.");
+      // notify trivia participants if any
+      triviaUsers.forEach((u) => {
+        io.to(u.socketId).emit("quiz:stopped", {
+          message: "Not enough players. Waiting for more to join...",
+        });
+      });
       startingQuestion = false;
       return;
     }
 
     const q = await gameService.getAndUpdateQuestion();
     if (!q) {
-      io.emit("quiz:end", { message: "No more questions available!" });
+      // no more questions: notify trivia participants only
+      triviaUsers.forEach((u) => {
+        io.to(u.socketId).emit("quiz:end", {
+          message: "No more questions available!",
+        });
+      });
       startingQuestion = false;
       return;
     }
@@ -362,18 +640,21 @@ async function startNewQuestion() {
 
     console.log(`📝 Starting Round ${currentRound}: ${q.question}`);
 
-    io.emit("quiz:question", {
-      round: currentRound,
-      questionId: q._id,
-      title: q.question,
-      category: q.category,
-      difficulty: q.difficulty,
-      reward_amount: q.reward_amount,
-      timeLeft: QUESTION_DURATION,
+    // Emit question only to trivia room participants
+    triviaUsers.forEach((u) => {
+      io.to(u.socketId).emit("quiz:question", {
+        round: currentRound,
+        questionId: q._id,
+        title: q.question,
+        category: q.category,
+        difficulty: q.difficulty,
+        reward_amount: q.reward_amount,
+        timeLeft: QUESTION_DURATION,
+      });
     });
 
-    // 🌟 Special user auto-answer logic
-    const specialUser = onlineUsers.find((u) => u.userId === SPECIAL_USER_ID);
+    // Special user auto-answer logic scoped to triviaUsers
+    const specialUser = triviaUsers.find((u) => u.userId === SPECIAL_USER_ID);
 
     if (specialUser) {
       const difficulty = q.difficulty?.toLowerCase();
@@ -410,7 +691,12 @@ async function startNewQuestion() {
     }, QUESTION_DURATION * 1000);
   } catch (err) {
     console.error("❌ Error in startNewQuestion:", err);
-    io.emit("quiz:error", { message: "Failed to fetch question" });
+    // send error to trivia room participants
+    triviaUsers.forEach((u) => {
+      io.to(u.socketId).emit("quiz:error", {
+        message: "Failed to fetch question",
+      });
+    });
   } finally {
     startingQuestion = false;
   }
