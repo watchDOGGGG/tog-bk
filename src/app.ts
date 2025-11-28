@@ -424,6 +424,8 @@ io.on("connection", (socket) => {
       onlineUsers = onlineUsers.filter((u) => u.userId !== user.userId);
       io.emit("players:update", onlineUsers);
 
+      console.log("emiting leftover online users", onlineUsers);
+
       triviaUsers = triviaUsers.filter((u) => u.userId !== user.userId);
       gameRooms = gameRooms.map((r) =>
         r.name === "general" ? { ...r, users: triviaUsers.length } : r
